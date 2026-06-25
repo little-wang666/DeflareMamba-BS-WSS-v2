@@ -1,5 +1,5 @@
 # general settings
-name: DeflareMamba_flare7kpp_baseline_option.yml
+name: DeflareMamba_flare7kpp_bs_wss_option.yml
 model_type: DeflareModel
 scale: 1
 num_gpu: 2  # set num_gpu: 0 for cpu mode
@@ -30,7 +30,6 @@ datasets:
       shear: 20
     mask_type: ~
 
-    
     # data loader
     use_shuffle: true
     num_worker_per_gpu: 4
@@ -57,7 +56,12 @@ network_g:
   depths: [1,2,4, 4, 4,2,1]
   embed_dim: 40
   mlp_ratio: 1.
-  use_wavelet_vssm: false
+  use_wavelet_vssm: true
+  wavelet_vssm_stages: [encoder_l, decoder_h]  # options: encoder_l, bottleneck_h, decoder_h, all
+  wavelet_vssm_last_only: true
+  wavelet_edge_kernel: 7
+  wavelet_use_hh_confidence: true
+  wavelet_use_cross_band_interaction: true
 
 # path
 path:

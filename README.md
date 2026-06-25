@@ -1,38 +1,46 @@
-# DeflareMamba-BS-WSS v2.1
+# DeflareMamba-BS-WSS v2.2
 
 正在努力学习中
 
-## v2.1 修改说明
+## What Changed In v2.2
 
-本仓库基于 DeflareMamba 添加 Band-specific Wavelet Selective Scan (BS-WSS)。
+This branch keeps the BS-WSS model logic from v2.1 and focuses on reproducibility and configuration cleanup.
 
-核心路径为：
+Changes:
 
-```text
-feature -> Haar DWT -> LL/LH/HL/HH -> band-specific branches -> cross-band interaction -> Haar IWT
-```
-
-主要改动：
-
-- 默认训练配置已启用 `use_wavelet_vssm: true`。
-- 默认频带模块位置为 `wavelet_vssm_stages: [encoder_l, decoder_h]`。
-- LL 分支继续使用原 DeflareMamba 的 selective scan。
-- LH/HL 分支使用轻量方向卷积分支，不是完整 Strip Attention。
-- HH 分支升级为双门控：
+- Restored a true baseline config:
+  `options/DeflareMamba_flare7kpp_baseline_option.yml`
+- Added a separate BS-WSS config:
+  `options/DeflareMamba_flare7kpp_bs_wss_option.yml`
+- Added a minimal forward shape test:
+  `scripts/test_bs_wss_forward.py`
+- Kept the v2.1 HH dual-gate detail branch:
 
 ```text
 HH' = HH - suppress_gate * artifact_feature + restore_gate * detail_feature
 ```
 
-## 推荐训练配置
+## Config Files
 
-默认配置文件位于：
+Baseline DeflareMamba:
 
 ```text
 options/DeflareMamba_flare7kpp_baseline_option.yml
 ```
 
-当前推荐配置：
+Important setting:
+
+```yaml
+use_wavelet_vssm: false
+```
+
+BS-WSS:
+
+```text
+options/DeflareMamba_flare7kpp_bs_wss_option.yml
+```
+
+Recommended setting:
 
 ```yaml
 use_wavelet_vssm: true
@@ -43,31 +51,51 @@ wavelet_use_hh_confidence: true
 wavelet_use_cross_band_interaction: true
 ```
 
-如果只想做第一版轻量消融，可以改为：
+For a lighter first ablation:
 
 ```yaml
 wavelet_vssm_stages: [decoder_h]
 ```
 
-如果想做更激进实验，可以改为：
+For a more aggressive experiment:
 
 ```yaml
 wavelet_vssm_stages: [all]
 ```
 
-## 消融实验建议
+## Forward Test
 
-建议依次比较：
+Run both baseline and BS-WSS shape checks:
 
-```text
-Baseline DeflareMamba
-BS-WSS decoder_h only
-BS-WSS encoder_l + decoder_h
-BS-WSS all stages
-BS-WSS without HH dual gate
-BS-WSS without cross-band interaction
+```bash
+python scripts/test_bs_wss_forward.py
 ```
 
-## 注意
+Run only BS-WSS:
 
-本版本保持 DeflareMamba 原始输入输出、U-shaped 主干和训练流程基本不变，主要修改位于 `SS2D` 内部的小波频带路径。
+```bash
+python scripts/test_bs_wss_forward.py --case bs_wss
+```
+
+Run only baseline:
+
+```bash
+python scripts/test_bs_wss_forward.py --case baseline
+```
+
+Expected output shape:
+
+```text
+(1, 6, 512, 512)
+```
+
+## Suggested Order
+
+1. Run `python -m py_compile basicsr/archs/DeflareMamba_arch.py`.
+2. Run `python -m py_compile basicsr/archs/wavelet_vssm_modules.py`.
+3. Run `python scripts/test_bs_wss_forward.py`.
+4. Start training with the BS-WSS config after the shape test passes.
+
+## Notes
+
+The original DeflareMamba input/output format, U-shaped backbone, training pipeline, and 6-channel output head are kept. The main algorithmic change is inside the `SS2D` feature path, where the feature map is split by Haar DWT into LL/LH/HL/HH bands and restored through band-specific branches before Haar IWT reconstruction.
