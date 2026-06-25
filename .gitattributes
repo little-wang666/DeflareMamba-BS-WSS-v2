@@ -1,0 +1,7 @@
+basicsr/archs/wavelet_vssm_modules.py text eol=lf
+basicsr/archs/DeflareMamba_arch.py text eol=lf
+scripts/test_bs_wss_forward.py text eol=lf
+scripts/check_text_format.py text eol=lf
+options/DeflareMamba_flare7kpp_baseline_option.yml text eol=lf
+options/DeflareMamba_flare7kpp_bs_wss_option.yml text eol=lf
+README.md text eol=lf

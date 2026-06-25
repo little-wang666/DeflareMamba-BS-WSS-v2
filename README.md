@@ -1,6 +1,22 @@
-# DeflareMamba-BS-WSS v2.2
+# DeflareMamba-BS-WSS v2.3
 
 正在努力学习中
+
+## What Changed In v2.3
+
+This branch keeps the BS-WSS algorithm logic unchanged and fixes repository text-format hygiene.
+
+Changes:
+
+- Added `.gitattributes` to force LF line endings for Python, YAML, Markdown, shell, and text files.
+- Added `scripts/check_text_format.py` to verify that key files are normal multi-line text files.
+- Kept the v2.2 baseline/BS-WSS config split and forward test script.
+
+Run the format check:
+
+```bash
+python scripts/check_text_format.py
+```
 
 ## What Changed In v2.2
 
