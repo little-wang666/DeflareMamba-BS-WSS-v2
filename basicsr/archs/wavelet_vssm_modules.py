@@ -74,19 +74,26 @@ class ConfidenceDetailBranch(nn.Module):
     def __init__(self, dim, use_confidence=True):
         super().__init__()
         self.use_confidence = use_confidence
-        self.expand = nn.Conv2d(dim, dim * 2, 1)
-        self.dwconv = nn.Conv2d(dim * 2, dim * 2, 3, padding=1, groups=dim * 2)
-        self.project = nn.Conv2d(dim, dim, 1)
-        self.confidence = nn.Conv2d(dim * 4, dim, 1)
+        self.detail_expand = nn.Conv2d(dim, dim * 2, 1)
+        self.detail_dwconv = nn.Conv2d(dim * 2, dim * 2, 3, padding=1, groups=dim * 2)
+        self.detail_project = nn.Conv2d(dim, dim, 1)
+        self.artifact_expand = nn.Conv2d(dim, dim * 2, 1)
+        self.artifact_dwconv = nn.Conv2d(dim * 2, dim * 2, 3, padding=1, groups=dim * 2)
+        self.artifact_project = nn.Conv2d(dim, dim, 1)
+        self.dual_gate = nn.Conv2d(dim * 4, dim * 2, 1)
 
     def forward(self, hh, ll_context, lh_context, hl_context):
-        detail = self.dwconv(self.expand(hh))
+        detail = self.detail_dwconv(self.detail_expand(hh))
         a, b = detail.chunk(2, dim=1)
-        detail = self.project(a * b)
-        if self.use_confidence:
-            confidence = torch.sigmoid(self.confidence(torch.cat([ll_context, lh_context, hl_context, hh], dim=1)))
-            detail = confidence * detail
-        return hh + detail
+        detail = self.detail_project(a * b)
+        artifact = self.artifact_dwconv(self.artifact_expand(hh))
+        a, b = artifact.chunk(2, dim=1)
+        artifact = self.artifact_project(a * b)
+        if not self.use_confidence:
+            return hh + detail
+        gates = torch.sigmoid(self.dual_gate(torch.cat([ll_context, lh_context, hl_context, hh], dim=1)))
+        suppress_gate, restore_gate = gates.chunk(2, dim=1)
+        return hh - suppress_gate * artifact + restore_gate * detail
 
 
 class CrossBandInteraction(nn.Module):
