@@ -10,6 +10,15 @@ from basicsr.utils.registry import ARCH_REGISTRY
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 from einops import rearrange, repeat
+from basicsr.archs.wavelet_vssm_modules import (
+    HaarDWT,
+    HaarIWT,
+    DirectionalEdgeBranch,
+    ConfidenceDetailBranch,
+    CrossBandInteraction,
+    pad_to_even,
+    crop_to_size,
+)
 
 
 
@@ -285,6 +294,10 @@ class SS2D(nn.Module):
             multi_scale=True,
             parallel=True,
             level_reverse=False,
+            use_wavelet_vssm=False,
+            wavelet_edge_kernel=7,
+            wavelet_use_hh_confidence=True,
+            wavelet_use_cross_band_interaction=True,
             device=None,
             dtype=None,
             **kwargs,
@@ -300,6 +313,7 @@ class SS2D(nn.Module):
         self.multi_scale = multi_scale
         self.parallel = parallel
         self.level_reverse = level_reverse
+        self.use_wavelet_vssm = use_wavelet_vssm
     
 
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
@@ -341,6 +355,12 @@ class SS2D(nn.Module):
         self.out_norm = nn.LayerNorm(self.d_inner)
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
+        if self.use_wavelet_vssm:
+            self.dwt = HaarDWT()
+            self.iwt = HaarIWT()
+            self.edge_branch = DirectionalEdgeBranch(self.d_inner, kernel=wavelet_edge_kernel)
+            self.detail_branch = ConfidenceDetailBranch(self.d_inner, use_confidence=wavelet_use_hh_confidence)
+            self.cross_band = CrossBandInteraction(self.d_inner, enabled=wavelet_use_cross_band_interaction)
 
         # self.fusion_conv = nn.Conv2d(self.d_inner * 3, self.d_inner, kernel_size=1)
 
@@ -598,6 +618,38 @@ class SS2D(nn.Module):
             return y1 + y2 + y3 + y4
 
         B, C, H, W = x.shape
+
+        if self.use_wavelet_vssm:
+            x_pad, original_size = pad_to_even(x)
+            ll, lh, hl, hh = self.dwt(x_pad)
+            _, _, h_sub, w_sub = ll.shape
+
+            if not self.multi_scale:
+                ll_out = process_group(ll, 0)
+                ll_out = ll_out.view(B, C, h_sub, w_sub)
+            else:
+                ll_y0 = process_group(ll, 0)
+                ll_y0 = ll_y0.view(B, C, h_sub, w_sub)
+
+                ll_level1 = get_sample_img(ll, h_sub, w_sub, level=1)
+                b1, c1, h1, w1 = ll_level1.shape
+                ll_y1 = process_group(ll_level1, 1)
+                ll_y1 = ll_y1.view(b1, c1, h1, w1)
+                ll_y1 = reverse_sample_img(ll_y1, h_sub, w_sub, level=1)
+                ll_out = (ll_y0 + ll_y1) / 2
+
+            lh_out, hl_out = self.edge_branch(lh, hl, ll_out)
+            hh_out = self.detail_branch(hh, ll_out, lh_out, hl_out)
+            ll_f, lh_f, hl_f, hh_f = self.cross_band(ll_out, lh_out, hl_out, hh_out)
+            y = self.iwt(ll_f, lh_f, hl_f, hh_f)
+            y = crop_to_size(y, original_size)
+            y = y.permute(0, 2, 3, 1).contiguous()
+            y = self.out_norm(y)
+            y = y * F.silu(z)
+            out = self.out_proj(y)
+            if self.dropout is not None:
+                out = self.dropout(out)
+            return out
         
         if not self.multi_scale:
             y = process_group(x, 0)
@@ -730,7 +782,12 @@ class BasicLayer(nn.Module):
                  downsample=None,
                  use_checkpoint=False,
                  is_light_sr=False,
-                 multi_scale=False):
+                 multi_scale=False,
+                 use_wavelet_vssm=False,
+                 wavelet_vssm_last_only=True,
+                 wavelet_edge_kernel=7,
+                 wavelet_use_hh_confidence=True,
+                 wavelet_use_cross_band_interaction=True):
 
         super().__init__()
         self.dim = dim
@@ -752,7 +809,11 @@ class BasicLayer(nn.Module):
                     expand=self.mlp_ratio,
                     input_resolution=input_resolution,
                     is_light_sr=is_light_sr,
-                    multi_scale=False
+                    multi_scale=False,
+                    use_wavelet_vssm=use_wavelet_vssm and not wavelet_vssm_last_only,
+                    wavelet_edge_kernel=wavelet_edge_kernel,
+                    wavelet_use_hh_confidence=wavelet_use_hh_confidence,
+                    wavelet_use_cross_band_interaction=wavelet_use_cross_band_interaction
                 ))
         self.blocks.append(VSSBlock(
                 hidden_dim=dim,
@@ -763,7 +824,11 @@ class BasicLayer(nn.Module):
                 expand=self.mlp_ratio,
                 input_resolution=input_resolution,
                 is_light_sr=is_light_sr,
-                multi_scale=multi_scale
+                multi_scale=multi_scale,
+                use_wavelet_vssm=use_wavelet_vssm,
+                wavelet_edge_kernel=wavelet_edge_kernel,
+                wavelet_use_hh_confidence=wavelet_use_hh_confidence,
+                wavelet_use_cross_band_interaction=wavelet_use_cross_band_interaction
             ))
         # patch merging layer
         if downsample is not None:
@@ -835,6 +900,12 @@ class DeflareMamba(nn.Module):
                  img_range=1.,
                  upsampler='',
                  resi_connection='1conv',
+                 use_wavelet_vssm=False,
+                 wavelet_vssm_stages=('decoder_h',),
+                 wavelet_vssm_last_only=True,
+                 wavelet_edge_kernel=7,
+                 wavelet_use_hh_confidence=True,
+                 wavelet_use_cross_band_interaction=True,
                  **kwargs):
         super(DeflareMamba, self).__init__()
         num_in_ch = 3  # 3+3
@@ -850,6 +921,19 @@ class DeflareMamba(nn.Module):
         self.upscale = upscale
         self.upsampler = upsampler
         self.mlp_ratio = mlp_ratio
+        if wavelet_vssm_stages is None:
+            wavelet_vssm_stages = ('decoder_h',)
+        self.wavelet_vssm_stages = set(wavelet_vssm_stages)
+
+        def use_wavelet_stage(stage):
+            return use_wavelet_vssm and ('all' in self.wavelet_vssm_stages or stage in self.wavelet_vssm_stages)
+
+        wavelet_kwargs = dict(
+            wavelet_vssm_last_only=wavelet_vssm_last_only,
+            wavelet_edge_kernel=wavelet_edge_kernel,
+            wavelet_use_hh_confidence=wavelet_use_hh_confidence,
+            wavelet_use_cross_band_interaction=wavelet_use_cross_band_interaction,
+        )
         # ------------------------- 1, shallow feature extraction ------------------------- #
         self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
 
@@ -900,7 +984,9 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=False  
+            multi_scale=False,
+            use_wavelet_vssm=use_wavelet_stage('encoder_l'),
+            **wavelet_kwargs
         )
         self.enc0_norm = norm_layer(embed_dim)
         self.downsample_0 = nn.Conv2d(embed_dim, embed_dim*2, kernel_size=4, stride=2, padding=1)
@@ -937,7 +1023,9 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=False  
+            multi_scale=False,
+            use_wavelet_vssm=use_wavelet_stage('encoder_l'),
+            **wavelet_kwargs
         )
         self.enc1_norm = norm_layer(embed_dim * 2)
         self.downsample_1 = nn.Conv2d(embed_dim*2, embed_dim*4, kernel_size=4, stride=2, padding=1)
@@ -974,7 +1062,9 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=False  
+            multi_scale=False,
+            use_wavelet_vssm=use_wavelet_stage('encoder_l'),
+            **wavelet_kwargs
         )
         self.enc2_norm = norm_layer(embed_dim * 4)
         self.downsample_2 = nn.Conv2d(embed_dim*4, embed_dim*8, kernel_size=4, stride=2, padding=1)
@@ -1048,7 +1138,9 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=True  # 最后一层设置为True
+            multi_scale=True,
+            use_wavelet_vssm=use_wavelet_stage('bottleneck_h'),
+            **wavelet_kwargs
         )
         self.bottle_norm = norm_layer(embed_dim * 8)
 
@@ -1123,7 +1215,9 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=True 
+            multi_scale=True,
+            use_wavelet_vssm=use_wavelet_stage('decoder_h'),
+            **wavelet_kwargs
         )
         self.dec1_norm = norm_layer(embed_dim * 8)
 
@@ -1160,7 +1254,9 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=True 
+            multi_scale=True,
+            use_wavelet_vssm=use_wavelet_stage('decoder_h'),
+            **wavelet_kwargs
         )
         self.dec2_norm = norm_layer(embed_dim * 4)
 
@@ -1197,7 +1293,9 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=True  
+            multi_scale=True,
+            use_wavelet_vssm=use_wavelet_stage('decoder_h'),
+            **wavelet_kwargs
         )
         self.dec3_norm = norm_layer(embed_dim*2)
 
@@ -1361,7 +1459,12 @@ class ResidualGroup(nn.Module):
                  patch_size=None,
                  resi_connection='1conv',
                  is_light_sr=False,
-                 multi_scale=False):
+                 multi_scale=False,
+                 use_wavelet_vssm=False,
+                 wavelet_vssm_last_only=True,
+                 wavelet_edge_kernel=7,
+                 wavelet_use_hh_confidence=True,
+                 wavelet_use_cross_band_interaction=True):
         super(ResidualGroup, self).__init__()
 
         self.dim = dim
@@ -1378,7 +1481,12 @@ class ResidualGroup(nn.Module):
             downsample=downsample,
             use_checkpoint=use_checkpoint,
             is_light_sr=is_light_sr,
-            multi_scale=multi_scale
+            multi_scale=multi_scale,
+            use_wavelet_vssm=use_wavelet_vssm,
+            wavelet_vssm_last_only=wavelet_vssm_last_only,
+            wavelet_edge_kernel=wavelet_edge_kernel,
+            wavelet_use_hh_confidence=wavelet_use_hh_confidence,
+            wavelet_use_cross_band_interaction=wavelet_use_cross_band_interaction
         )
 
         # build the last conv layer in each residual state space group
