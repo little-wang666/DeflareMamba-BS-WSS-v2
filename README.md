@@ -1,6 +1,23 @@
-# DeflareMamba-BS-WSS v2.3
+# DeflareMamba-BS-WSS v2.4
 
 正在努力学习中
+
+## What Changed In v2.4
+
+This branch keeps the BS-WSS algorithm logic unchanged and fixes the text-format issue more strictly.
+
+Changes:
+
+- Expanded `.gitattributes` to cover normal source/config/document files.
+- Added `.editorconfig` for UTF-8 and LF editor defaults.
+- Strengthened `scripts/check_text_format.py` so key files must be LF-only and normal multi-line text.
+- Re-saved key model/config/test files with LF line endings.
+
+Run the strict format check:
+
+```bash
+python scripts/check_text_format.py
+```
 
 ## What Changed In v2.3
 
