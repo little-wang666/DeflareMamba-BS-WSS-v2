@@ -9,6 +9,7 @@ DEFAULT_FILES = [
     'basicsr/archs/DeflareMamba_arch.py',
     'scripts/test_bs_wss_forward.py',
     'scripts/check_text_format.py',
+    'scripts/verify_v2_5.py',
     'options/DeflareMamba_flare7kpp_baseline_option.yml',
     'options/DeflareMamba_flare7kpp_bs_wss_option.yml',
     'README.md',

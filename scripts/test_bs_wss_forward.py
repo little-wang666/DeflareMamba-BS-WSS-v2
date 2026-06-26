@@ -2,14 +2,25 @@ import argparse
 import os
 import sys
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        'Missing dependency: torch. Install the training environment dependencies before running forward tests.'
+    ) from exc
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from basicsr.archs.DeflareMamba_arch import DeflareMamba
+try:
+    from basicsr.archs.DeflareMamba_arch import DeflareMamba
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        f'Missing dependency while importing DeflareMamba: {exc.name}. '
+        'Install the original DeflareMamba runtime dependencies, including mamba_ssm, before running forward tests.'
+    ) from exc
 
 
 def parse_depths(value):

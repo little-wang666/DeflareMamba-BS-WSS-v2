@@ -1,6 +1,39 @@
-# DeflareMamba-BS-WSS v2.4
+# DeflareMamba-BS-WSS v2.5
 
 正在努力学习中
+
+## What Changed In v2.5
+
+This branch follows `DeflareMamba_BS_WSS_Modification_Guide.pdf`.
+
+The BS-WSS algorithm logic is unchanged from v2.1-v2.4. v2.5 focuses on repository correctness and reproducibility:
+
+- Keeps the true baseline config:
+  `options/DeflareMamba_flare7kpp_baseline_option.yml`
+- Keeps the separate BS-WSS config:
+  `options/DeflareMamba_flare7kpp_bs_wss_option.yml`
+- Keeps normal multi-line Python/YAML/Markdown files.
+- Adds `scripts/verify_v2_5.py` for one-command repository verification.
+- Extends text-format checking to include the v2.5 verification script.
+
+Recommended v2.5 verification:
+
+```bash
+python scripts/verify_v2_5.py
+```
+
+If the current machine does not have the required runtime dependencies for forward tests, run:
+
+```bash
+python scripts/verify_v2_5.py --skip-forward
+```
+
+Then run the forward tests in the actual training environment:
+
+```bash
+python scripts/test_bs_wss_forward.py --case baseline
+python scripts/test_bs_wss_forward.py --case bs_wss
+```
 
 ## What Changed In v2.4
 
