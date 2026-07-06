@@ -10,7 +10,7 @@ from basicsr.utils.registry import ARCH_REGISTRY
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 from einops import rearrange, repeat
-
+from basicsr.utils.wavelet_utils import dwt2, idwt2
 
 
 NEG_INF = -1000000
@@ -196,10 +196,10 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
-##local_scan代码
+##local_scan浠ｇ爜
 def local_scan(x, w=8, H=14, W=14, flip=False, column_first=False):
     """Local windowed scan in LocalMamba
-    Input: 
+    Input:
         x: [B, L, C]
         H, W: original width and height before padding
         column_first: column-wise scan first (the additional direction in VMamba)
@@ -221,7 +221,7 @@ def local_scan(x, w=8, H=14, W=14, flip=False, column_first=False):
 
 def local_reverse(x, w=8, H=14, W=14, flip=False, column_first=False):
     """Local windowed scan in LocalMamba
-    Input: 
+    Input:
         x: [B, C, L]
         H, W: original width and height before padding
         column_first: column-wise scan first (the additional direction in VMamba)
@@ -263,6 +263,108 @@ def reverse_sample_img(y,h,w,level=1):
         y=y[:,:,:h,:w]
     return y
 
+class DirectionalEdgeBranch(nn.Module):
+    """
+    Directional branch for LH/HL wavelet bands.
+    LH/HL mainly contain directional edges and object contours.
+    """
+
+    def __init__(self, dim, kernel_size=7):
+        super().__init__()
+        pad = kernel_size // 2
+
+        self.lh_h = nn.Conv2d(dim, dim, kernel_size=(1, kernel_size),
+                              padding=(0, pad), groups=dim)
+        self.lh_v = nn.Conv2d(dim, dim, kernel_size=(kernel_size, 1),
+                              padding=(pad, 0), groups=dim)
+        self.lh_proj = nn.Conv2d(dim, dim, 1)
+
+        self.hl_h = nn.Conv2d(dim, dim, kernel_size=(1, kernel_size),
+                              padding=(0, pad), groups=dim)
+        self.hl_v = nn.Conv2d(dim, dim, kernel_size=(kernel_size, 1),
+                              padding=(pad, 0), groups=dim)
+        self.hl_proj = nn.Conv2d(dim, dim, 1)
+
+        self.edge_gate = nn.Sequential(
+            nn.Conv2d(dim * 3, dim * 2, 1),
+            nn.GELU(),
+            nn.Conv2d(dim * 2, dim * 2, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, ll, lh, hl):
+        lh_feat = self.lh_proj(self.lh_h(lh) + self.lh_v(lh))
+        hl_feat = self.hl_proj(self.hl_h(hl) + self.hl_v(hl))
+
+        gates = self.edge_gate(torch.cat([ll, lh, hl], dim=1))
+        g_lh, g_hl = torch.chunk(gates, 2, dim=1)
+
+        lh_out = lh + g_lh * lh_feat
+        hl_out = hl + g_hl * hl_feat
+
+        return lh_out, hl_out
+
+class GatedDetailBranch(nn.Module):
+    """
+    Gated branch for HH wavelet band.
+    HH contains corners, fine textures, sharp details, but also fake high-frequency artifacts.
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+
+        self.expand = nn.Conv2d(dim, dim * 2, 1)
+        self.dwconv = nn.Conv2d(dim * 2, dim * 2, 3, 1, 1, groups=dim * 2)
+        self.project = nn.Conv2d(dim, dim, 1)
+
+        self.conf_gate = nn.Sequential(
+            nn.Conv2d(dim * 4, dim, 1),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, ll, lh, hl, hh):
+        feat = self.expand(hh)
+        feat = self.dwconv(feat)
+
+        a, b = torch.chunk(feat, 2, dim=1)
+        detail = a * b
+        detail = self.project(detail)
+
+        conf = self.conf_gate(torch.cat([ll, lh, hl, hh], dim=1))
+
+        hh_out = hh + conf * detail
+        return hh_out
+
+class CrossBandInteraction(nn.Module):
+    """
+    Cross-band interaction before inverse wavelet transform.
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+
+        self.message = nn.Conv2d(dim * 4, dim * 4, 1)
+        self.gate = nn.Sequential(
+            nn.Conv2d(dim * 4, dim * 4, 1),
+            nn.Sigmoid()
+        )
+        self.out_proj = nn.Conv2d(dim * 4, dim * 4, 1)
+
+    def forward(self, ll, lh, hl, hh):
+        x = torch.cat([ll, lh, hl, hh], dim=1)
+
+        msg = self.message(x)
+        gate = self.gate(x)
+
+        x = x + gate * msg
+        x = self.out_proj(x)
+
+        ll, lh, hl, hh = torch.chunk(x, 4, dim=1)
+        return ll, lh, hl, hh
+
+
 
 
 
@@ -285,6 +387,7 @@ class SS2D(nn.Module):
             multi_scale=True,
             parallel=True,
             level_reverse=False,
+            use_wavelet=False,
             device=None,
             dtype=None,
             **kwargs,
@@ -300,7 +403,7 @@ class SS2D(nn.Module):
         self.multi_scale = multi_scale
         self.parallel = parallel
         self.level_reverse = level_reverse
-    
+
 
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
         self.conv2d = nn.Conv2d(
@@ -314,11 +417,18 @@ class SS2D(nn.Module):
         )
         self.act = nn.SiLU()
 
+        self.use_wavelet = use_wavelet
+
+        if self.use_wavelet:
+            self.edge_branch = DirectionalEdgeBranch(self.d_inner)
+            self.detail_branch = GatedDetailBranch(self.d_inner)
+            self.cross_band = CrossBandInteraction(self.d_inner)
+
         num_groups = 2 if multi_scale else 1
         param_groups = [
             self.init_group_params(
                 d_inner=self.d_inner,
-                d_state=self.d_state, 
+                d_state=self.d_state,
                 dt_rank=self.dt_rank,
                 dt_scale=dt_scale,
                 dt_init=dt_init,
@@ -332,7 +442,7 @@ class SS2D(nn.Module):
 
         for i, (x_proj_w, dt_projs_w, dt_projs_b, a_logs, ds) in enumerate(param_groups):
             setattr(self, f'x_proj_weight_{i}', x_proj_w)
-            setattr(self, f'dt_projs_weight_{i}', dt_projs_w) 
+            setattr(self, f'dt_projs_weight_{i}', dt_projs_w)
             setattr(self, f'dt_projs_bias_{i}', dt_projs_b)
             setattr(self, f'A_logs_{i}', a_logs)
             setattr(self, f'Ds_{i}', ds)
@@ -345,22 +455,22 @@ class SS2D(nn.Module):
         # self.fusion_conv = nn.Conv2d(self.d_inner * 3, self.d_inner, kernel_size=1)
 
     def init_group_params(
-        self, 
-        d_inner=None,      
-        d_state=None,      
-        dt_rank=None,      
-        copies=4,          
-        dt_scale=1.0,      
-        dt_init="random",  
-        dt_min=0.001,      
-        dt_max=0.1,        
+        self,
+        d_inner=None,
+        d_state=None,
+        dt_rank=None,
+        copies=4,
+        dt_scale=1.0,
+        dt_init="random",
+        dt_min=0.001,
+        dt_max=0.1,
         dt_init_floor=1e-4,
-        device=None,       
-        dtype=None,        
-        merge=True         
+        device=None,
+        dtype=None,
+        merge=True
     ):
         """
-        
+
         Returns:
             tuple: (x_proj_weight, dt_projs_weight, dt_projs_bias, A_logs, Ds)
         """
@@ -372,7 +482,7 @@ class SS2D(nn.Module):
             d_inner, dt_rank, d_state,
             copies=copies, device=device, dtype=dtype
         )
-        
+
         dt_projs_weight, dt_projs_bias = self.dt_projs_init(
             dt_rank, d_inner,
             dt_scale=dt_scale, dt_init=dt_init,
@@ -380,17 +490,17 @@ class SS2D(nn.Module):
             dt_init_floor=dt_init_floor,
             copies=copies, device=device, dtype=dtype
         )
-        
+
         A_logs = self.A_log_init(
-            d_state, d_inner, 
+            d_state, d_inner,
             copies=copies, device=device, merge=merge
         )
-        
+
         Ds = self.D_init(
-            d_inner, 
+            d_inner,
             copies=copies, device=device, merge=merge
         )
-        
+
         return x_proj_weight, dt_projs_weight, dt_projs_bias, A_logs, Ds
 
     @staticmethod
@@ -415,8 +525,8 @@ class SS2D(nn.Module):
         x_proj_weight = torch.stack([t.weight for t in x_projs], dim=0)  # (copies, N, inner)
         return nn.Parameter(x_proj_weight)
 
-    @staticmethod 
-    def dt_projs_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, 
+    @staticmethod
+    def dt_projs_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001,
                       dt_max=0.1, dt_init_floor=1e-4, copies=1, device=None, dtype=None, merge=True):
         """Initialize delta projection parameters
         Args:
@@ -425,7 +535,7 @@ class SS2D(nn.Module):
             dt_scale: scale factor for initialization
             dt_init: initialization type ("constant" or "random")
             dt_min: minimum delta value
-            dt_max: maximum delta value 
+            dt_max: maximum delta value
             dt_init_floor: minimum floor value
             copies: number of copies
             device: torch device
@@ -441,7 +551,7 @@ class SS2D(nn.Module):
         ]
         dt_projs_weight = torch.stack([t.weight for t in dt_projs], dim=0)  # (copies, inner, rank)
         dt_projs_bias = torch.stack([t.bias for t in dt_projs], dim=0)  # (copies, inner)
-        
+
         return nn.Parameter(dt_projs_weight), nn.Parameter(dt_projs_bias)
 
     @staticmethod
@@ -488,7 +598,7 @@ class SS2D(nn.Module):
         A_log = nn.Parameter(A_log)
         A_log._no_weight_decay = True
         return A_log
-    
+
     @staticmethod
     def D_init(d_inner, copies=1, device=None, merge=True):
         # D "skip" parameter
@@ -519,13 +629,13 @@ class SS2D(nn.Module):
         B, C, H, W = x.shape
         L = H * W
         K = 4
-        
+
         # h v stacking
         x_hwwh = torch.stack([
-            x.contiguous().view(B, -1, L), 
+            x.contiguous().view(B, -1, L),
             torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)
         ], dim=1).view(B, 2, -1, L)
-        
+
         # h v hf vf concatenation
         xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (B, 4, C, L)
         xs = xs.permute(0, 1, 3, 2) # (B, 4, L, C)
@@ -582,81 +692,89 @@ class SS2D(nn.Module):
 
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.act(self.conv2d(x))
-        
+
         def process_group(x, scan_level):
             x_proj_weight = getattr(self, f'x_proj_weight_{scan_level}')
             dt_projs_weight = getattr(self, f'dt_projs_weight_{scan_level}')
             dt_projs_bias = getattr(self, f'dt_projs_bias_{scan_level}')
             A_logs = getattr(self, f'A_logs_{scan_level}')
             Ds = getattr(self, f'Ds_{scan_level}')
-            
+
             y1, y2, y3, y4 = self.forward_core(
                 x, x_proj_weight, dt_projs_weight, dt_projs_bias, A_logs, Ds, self.d_state, self.dt_rank
             )
-            
+
             assert y1.dtype == torch.float32
             return y1 + y2 + y3 + y4
 
+        def process_mamba_2d(feat):
+            """
+            Apply original Local / Hierarchical selective scan to a 2D feature map.
+
+            Args:
+                feat: [B, C, H, W]
+
+            Returns:
+                out: [B, C, H, W]
+            """
+            Bf, Cf, Hf, Wf = feat.shape
+
+            if not self.multi_scale:
+                y = process_group(feat, 0)
+                y = y.view(Bf, Cf, Hf, Wf)
+                return y
+
+            # Hierarchical / multi-scale version.
+            # Current code initializes two parameter groups when multi_scale=True,
+            # so we safely use level 0 and level 1.
+            y0 = process_group(feat, 0)
+            y0 = y0.view(Bf, Cf, Hf, Wf)
+
+            x_level1 = get_sample_img(feat, Hf, Wf, level=1)
+            B1, C1, H1, W1 = x_level1.shape
+
+            y1 = process_group(x_level1, 1)
+            y1 = y1.view(B1, C1, H1, W1)
+            y1 = reverse_sample_img(y1, Hf, Wf, level=1)
+
+            y = (y0 + y1) / 2
+            return y
+
         B, C, H, W = x.shape
-        
-        if not self.multi_scale:
-            y = process_group(x, 0)
-            y = y.transpose(1, 2).contiguous().view(B, H, W, -1)
+
+        if self.use_wavelet:
+            ll, lh, hl, hh = dwt2(x)
+
+            ll_out = process_mamba_2d(ll)
+            lh_out, hl_out = self.edge_branch(ll_out, lh, hl)
+            hh_out = self.detail_branch(ll_out, lh_out, hl_out, hh)
+
+            ll_out, lh_out, hl_out, hh_out = self.cross_band(
+                ll_out, lh_out, hl_out, hh_out
+            )
+
+            y_2d = idwt2(ll_out, lh_out, hl_out, hh_out, out_size=(H, W))
+            y = y_2d.permute(0, 2, 3, 1).contiguous()
+
         else:
-            if not self.parallel:
-                if not self.level_reverse:
-                    y = process_group(x, 0)
-                    
-                    x_level1 = get_sample_img(y.view(B, C, H, W), H, W, level=1)
-                    B1, C1, H1, W1 = x_level1.shape
-                    y = process_group(x_level1, 1)
-                    y = y.view(B1, C1, H1, W1)
-                    y = reverse_sample_img(y, H, W, level=1)
-                    
-                    x_level2 = get_sample_img(y.view(B, C, H, W), H, W, level=2)
-                    B2, C2, H2, W2 = x_level2.shape
-                    y = process_group(x_level2, 2)
-                    y = y.view(B2, C2, H2, W2)
-                    y = reverse_sample_img(y, H, W, level=2)
-                else:
-                    x_level2 = get_sample_img(x, H, W, level=2)
-                    B2, C2, H2, W2 = x_level2.shape
-                    y = process_group(x_level2, 2)
-                    y = y.view(B2, C2, H2, W2)
-                    y = reverse_sample_img(y, H, W, level=2)
-                    
-                    x_level1 = get_sample_img(y.view(B, C, H, W), H, W, level=1)
-                    B1, C1, H1, W1 = x_level1.shape
-                    y = process_group(x_level1, 1)
-                    y = y.view(B1, C1, H1, W1)
-                    y = reverse_sample_img(y, H, W, level=1)
-                    
-                    y = process_group(y.view(B, C, H, W), 0)
-                
+            if not self.multi_scale:
+                y = process_group(x, 0)
                 y = y.transpose(1, 2).contiguous().view(B, H, W, -1)
             else:
-                ##level0
-                y0 = process_group(x, 0)
-                y0 = y0.transpose(1, 2).contiguous().view(B, H, W, -1)
-                
-                # level 1
-                x_level1 = get_sample_img(x, H, W, level=1)
-                B1, C1, H1, W1 = x_level1.shape
-                y1 = process_group(x_level1, 1)
-                y1 = y1.view(B1, C1, H1, W1)
-                y1 = reverse_sample_img(y1, H, W, level=1)
-                y1 = y1.transpose(1, 2).contiguous().view(B, H, W, -1)
-                
-                # level 2
-                # x_level2 = get_sample_img(x, H, W, level=2)
-                # B2, C2, H2, W2 = x_level2.shape
-                # y2 = process_group(x_level2, 2)
-                # y2 = y2.view(B2, C2, H2, W2)
-                # y2 = reverse_sample_img(y2, H, W, level=2)
-                # y2 = y2.transpose(1, 2).contiguous().view(B, H, W, -1)
-                
-                # y = (y0 + y1 + y2) / 3
-                y=(y0+y1)/2
+                if not self.parallel:
+                    ...
+                else:
+                    y0 = process_group(x, 0)
+                    y0 = y0.transpose(1, 2).contiguous().view(B, H, W, -1)
+
+                    x_level1 = get_sample_img(x, H, W, level=1)
+                    B1, C1, H1, W1 = x_level1.shape
+                    y1 = process_group(x_level1, 1)
+                    y1 = y1.view(B1, C1, H1, W1)
+                    y1 = reverse_sample_img(y1, H, W, level=1)
+                    y1 = y1.transpose(1, 2).contiguous().view(B, H, W, -1)
+
+                    y = (y0 + y1) / 2
 
         y = self.out_norm(y)
         y = y * F.silu(z)
@@ -664,6 +782,7 @@ class SS2D(nn.Module):
         if self.dropout is not None:
             out = self.dropout(out)
         return out
+
 
 
 class VSSBlock(nn.Module):
@@ -677,16 +796,18 @@ class VSSBlock(nn.Module):
             expand: float = 2.,
             is_light_sr: bool = False,
             multi_scale: bool = False,
+            use_wavelet: bool = False,
             **kwargs,
     ):
         super().__init__()
         self.ln_1 = norm_layer(hidden_dim)
         self.self_attention = SS2D(
-            d_model=hidden_dim, 
+            d_model=hidden_dim,
             d_state=d_state,
             expand=expand,
-            dropout=attn_drop_rate, 
+            dropout=attn_drop_rate,
             multi_scale=multi_scale,
+            use_wavelet=use_wavelet,
             **kwargs
         )
         self.drop_path = DropPath(drop_path)
@@ -730,7 +851,8 @@ class BasicLayer(nn.Module):
                  downsample=None,
                  use_checkpoint=False,
                  is_light_sr=False,
-                 multi_scale=False):
+                 multi_scale=False,
+                 use_wavelet=False):
 
         super().__init__()
         self.dim = dim
@@ -752,7 +874,8 @@ class BasicLayer(nn.Module):
                     expand=self.mlp_ratio,
                     input_resolution=input_resolution,
                     is_light_sr=is_light_sr,
-                    multi_scale=False
+                    multi_scale=False,
+                    use_wavelet=False
                 ))
         self.blocks.append(VSSBlock(
                 hidden_dim=dim,
@@ -763,7 +886,8 @@ class BasicLayer(nn.Module):
                 expand=self.mlp_ratio,
                 input_resolution=input_resolution,
                 is_light_sr=is_light_sr,
-                multi_scale=multi_scale
+                multi_scale=multi_scale,
+                use_wavelet=use_wavelet
             ))
         # patch merging layer
         if downsample is not None:
@@ -823,7 +947,7 @@ class DeflareMamba(nn.Module):
                  patch_size=1,
                  in_chans=3,
                  embed_dim=96,
-                 depths=(6, 6, 6, 6),
+                 depths=(6, 6, 6, 6, 6, 6, 6),
                  drop_rate=0.,
                  d_state=16,
                  mlp_ratio=2.,  ### expand
@@ -850,8 +974,12 @@ class DeflareMamba(nn.Module):
         self.upscale = upscale
         self.upsampler = upsampler
         self.mlp_ratio = mlp_ratio
-        # ------------------------- 1, shallow feature extraction ------------------------- #
+        # -------------------------
+        # 1. shallow feature extraction
+        # -------------------------
         self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
+
+
 
         self.is_light_sr = True if self.upsampler=='pixelshuffledirect' else False
         # ------------------------- 2, deep feature extraction ------------------------- #
@@ -900,7 +1028,8 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=False  
+            multi_scale=False,
+            use_wavelet=True
         )
         self.enc0_norm = norm_layer(embed_dim)
         self.downsample_0 = nn.Conv2d(embed_dim, embed_dim*2, kernel_size=4, stride=2, padding=1)
@@ -937,7 +1066,8 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=False  
+            multi_scale=False,
+            use_wavelet=True
         )
         self.enc1_norm = norm_layer(embed_dim * 2)
         self.downsample_1 = nn.Conv2d(embed_dim*2, embed_dim*4, kernel_size=4, stride=2, padding=1)
@@ -974,7 +1104,8 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=False  
+            multi_scale=False,
+            use_wavelet=True
         )
         self.enc2_norm = norm_layer(embed_dim * 4)
         self.downsample_2 = nn.Conv2d(embed_dim*4, embed_dim*8, kernel_size=4, stride=2, padding=1)
@@ -1011,7 +1142,7 @@ class DeflareMamba(nn.Module):
         #     patch_size=patch_size,
         #     resi_connection=resi_connection,
         #     is_light_sr=self.is_light_sr,
-        #     multi_scale=False  # 最后一层设置为True
+        #     multi_scale=False  # 鏈€鍚庝竴灞傝缃负True
         # )
         # self.enc3_norm = norm_layer(embed_dim * 8)
         # self.downsample_3 = nn.Conv2d(embed_dim*8, embed_dim*16, kernel_size=4, stride=2, padding=1)
@@ -1048,7 +1179,8 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=True  # 最后一层设置为True
+            multi_scale=True,  # 鏈€鍚庝竴灞傝缃负True
+            use_wavelet=True
         )
         self.bottle_norm = norm_layer(embed_dim * 8)
 
@@ -1086,7 +1218,7 @@ class DeflareMamba(nn.Module):
         #     patch_size=patch_size,
         #     resi_connection=resi_connection,
         #     is_light_sr=self.is_light_sr,
-        #     multi_scale=False  # 最后一层设置为True
+        #     multi_scale=False  # 鏈€鍚庝竴灞傝缃负True
         # )
         # self.dec0_norm = norm_layer(embed_dim * 16)
 
@@ -1123,7 +1255,8 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=True 
+            multi_scale=True,
+            use_wavelet=True
         )
         self.dec1_norm = norm_layer(embed_dim * 8)
 
@@ -1160,7 +1293,8 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=True 
+            multi_scale=True,
+            use_wavelet=True
         )
         self.dec2_norm = norm_layer(embed_dim * 4)
 
@@ -1197,7 +1331,8 @@ class DeflareMamba(nn.Module):
             patch_size=patch_size,
             resi_connection=resi_connection,
             is_light_sr=self.is_light_sr,
-            multi_scale=True  
+            multi_scale=True,
+            use_wavelet=True
         )
         self.dec3_norm = norm_layer(embed_dim*2)
 
@@ -1235,7 +1370,7 @@ class DeflareMamba(nn.Module):
 #             patch_size=patch_size,
 #             resi_connection=resi_connection,
 #             is_light_sr=self.is_light_sr,
-#             multi_scale=True  # 最后一层设置为True
+#             multi_scale=True  # 鏈€鍚庝竴灞傝缃负True
 #         )
 #         self.refine_norm = norm_layer(embed_dim)
 
@@ -1268,11 +1403,12 @@ class DeflareMamba(nn.Module):
 
     def forward_features(self, x, patch_embed, patch_unembed, norm, layer):
         x_size = (x.shape[2], x.shape[3])
-        x = patch_embed(x)  # N,L,C
+        x = patch_embed(x)
         x = layer(x, x_size)
-        x = norm(x)  # b seq_len c
+        x = norm(x)
         x = patch_unembed(x, x_size)
         return x
+
 
     def forward(self, x):
         self.mean = self.mean.type_as(x)
@@ -1314,7 +1450,7 @@ class DeflareMamba(nn.Module):
         y = self.conv_last(deconv3)
 
         # x = x / self.img_range + self.mean
-        ##输出控制0，1
+        ##杈撳嚭鎺у埗0锛?
         y = self.activation(y)
         return y
 
@@ -1361,7 +1497,8 @@ class ResidualGroup(nn.Module):
                  patch_size=None,
                  resi_connection='1conv',
                  is_light_sr=False,
-                 multi_scale=False):
+                 multi_scale=False,
+                 use_wavelet=False):
         super(ResidualGroup, self).__init__()
 
         self.dim = dim
@@ -1378,7 +1515,8 @@ class ResidualGroup(nn.Module):
             downsample=downsample,
             use_checkpoint=use_checkpoint,
             is_light_sr=is_light_sr,
-            multi_scale=multi_scale
+            multi_scale=multi_scale,
+            use_wavelet=use_wavelet
         )
 
         # build the last conv layer in each residual state space group
